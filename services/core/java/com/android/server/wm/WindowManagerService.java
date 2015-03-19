@@ -613,6 +613,13 @@ public class WindowManagerService extends IWindowManager.Stub
     static final long WALLPAPER_TIMEOUT_RECOVERY = 10000;
     boolean mAnimateWallpaperWithTarget;
 
+    // We give a wallpaper up to 1000ms to finish drawing before playing app transitions.
+    static final long WALLPAPER_DRAW_PENDING_TIMEOUT_DURATION = 1000;
+    static final int WALLPAPER_DRAW_NORMAL = 0;
+    static final int WALLPAPER_DRAW_PENDING = 1;
+    static final int WALLPAPER_DRAW_TIMEOUT = 2;
+    int mWallpaperDrawState = WALLPAPER_DRAW_NORMAL;
+
     AppWindowToken mFocusedApp = null;
 
     PowerManager mPowerManager;
@@ -4037,6 +4044,15 @@ public class WindowManagerService extends IWindowManager.Stub
             if (changed) {
                 mFocusedApp = newFocus;
                 mInputMonitor.setFocusedAppLw(newFocus);
+                setFocusedStackFrame();
+                if (SHOW_LIGHT_TRANSACTIONS) Slog.i(TAG, ">>> OPEN TRANSACTION setFocusedApp");
+                SurfaceControl.openTransaction();
+                try {
+                    setFocusedStackLayer();
+                } finally {
+                    SurfaceControl.closeTransaction();
+                    if (SHOW_LIGHT_TRANSACTIONS) Slog.i(TAG, ">>> CLOSE TRANSACTION setFocusedApp");
+                }
             }
 
             if (moveFocusNow && changed) {
@@ -4079,6 +4095,8 @@ public class WindowManagerService extends IWindowManager.Stub
                 mAppTransition.prepare();
                 mStartingIconInTransition = false;
                 mSkipAppTransitionAnimation = false;
+            }
+            if (mAppTransition.isTransitionSet()) {
                 mH.removeMessages(H.APP_TRANSITION_TIMEOUT);
                 mH.sendEmptyMessageDelayed(H.APP_TRANSITION_TIMEOUT, 5000);
             }
@@ -4644,6 +4662,7 @@ public class WindowManagerService extends IWindowManager.Stub
             }
 
             final long origId = Binder.clearCallingIdentity();
+            wtoken.inPendingTransaction = false;
             setTokenVisibilityLocked(wtoken, null, visible, AppTransition.TRANSIT_UNSET,
                     true, wtoken.voiceInteraction);
             wtoken.updateReportedVisibilityLocked();
@@ -6190,6 +6209,10 @@ public class WindowManagerService extends IWindowManager.Stub
                             ws.isDisplayedLw()) {
                         screenshotReady = true;
                     }
+
+                    if (ws.isFullscreen(dw, dh) && ws.isOpaqueDrawn()){
+                        break;
+                    }
                 }
 
                 if (appToken != null && appWin == null) {
@@ -7235,6 +7258,7 @@ public class WindowManagerService extends IWindowManager.Stub
             displayInfo.getAppMetrics(mDisplayMetrics);
             mDisplayManagerInternal.setDisplayInfoOverrideFromWindowManager(
                     displayContent.getDisplayId(), displayInfo);
+            displayContent.mBaseDisplayRect.set(0, 0, dw, dh);
         }
         if (false) {
             Slog.i(TAG, "Set app display size: " + appWidth + " x " + appHeight);
@@ -7618,6 +7642,7 @@ public class WindowManagerService extends IWindowManager.Stub
 
         public static final int CHECK_IF_BOOT_ANIMATION_FINISHED = 37;
         public static final int RESET_ANR_MESSAGE = 38;
+        public static final int WALLPAPER_DRAW_PENDING_TIMEOUT = 39;
 
         @Override
         public void handleMessage(Message msg) {
@@ -7872,8 +7897,12 @@ public class WindowManagerService extends IWindowManager.Stub
 
                 case APP_TRANSITION_TIMEOUT: {
                     synchronized (mWindowMap) {
-                        if (mAppTransition.isTransitionSet()) {
-                            if (DEBUG_APP_TRANSITIONS) Slog.v(TAG, "*** APP TRANSITION TIMEOUT");
+                        if (mAppTransition.isTransitionSet() || !mOpeningApps.isEmpty()
+                                    || !mClosingApps.isEmpty()) {
+                            if (DEBUG_APP_TRANSITIONS) Slog.v(TAG, "*** APP TRANSITION TIMEOUT."
+                                    + " isTransitionSet()=" + mAppTransition.isTransitionSet()
+                                    + " mOpeningApps.size()=" + mOpeningApps.size()
+                                    + " mClosingApps.size()=" + mClosingApps.size());
                             mAppTransition.setTimeout();
                             performLayoutAndPlaceSurfacesLocked();
                         }
@@ -8131,6 +8160,17 @@ public class WindowManagerService extends IWindowManager.Stub
                 case RESET_ANR_MESSAGE: {
                     synchronized (mWindowMap) {
                         mLastANRState = null;
+                    }
+                }
+                break;
+                case WALLPAPER_DRAW_PENDING_TIMEOUT: {
+                    synchronized (mWindowMap) {
+                        if (mWallpaperDrawState == WALLPAPER_DRAW_PENDING) {
+                            mWallpaperDrawState = WALLPAPER_DRAW_TIMEOUT;
+                            if (DEBUG_APP_TRANSITIONS || DEBUG_WALLPAPER) Slog.v(TAG,
+                                    "*** WALLPAPER DRAW TIMEOUT");
+                            performLayoutAndPlaceSurfacesLocked();
+                        }
                     }
                 }
                 break;
@@ -8898,7 +8938,8 @@ public class WindowManagerService extends IWindowManager.Stub
             if (!gone || !win.mHaveFrame || win.mLayoutNeeded
                     || ((win.isConfigChanged() || win.setInsetsChanged()) &&
                             ((win.mAttrs.privateFlags & PRIVATE_FLAG_KEYGUARD) != 0 ||
-                            win.mAppToken != null && win.mAppToken.layoutConfigChanges))
+                            (win.mHasSurface && win.mAppToken != null &&
+                            win.mAppToken.layoutConfigChanges)))
                     || win.mAttrs.type == TYPE_UNIVERSE_BACKGROUND) {
                 if (!win.mLayoutAttached) {
                     if (initial) {
@@ -9023,10 +9064,7 @@ public class WindowManagerService extends IWindowManager.Stub
                 "Checking " + NN + " opening apps (frozen="
                 + mDisplayFrozen + " timeout="
                 + mAppTransition.isTimeout() + ")...");
-        if (!mDisplayFrozen && !mAppTransition.isTimeout()) {
-            // If the display isn't frozen, wait to do anything until
-            // all of the apps are ready.  Otherwise just go because
-            // we'll unfreeze the display when everyone is ready.
+        if (!mAppTransition.isTimeout()) {
             for (i=0; i<NN && goodToGo; i++) {
                 AppWindowToken wtoken = mOpeningApps.valueAt(i);
                 if (DEBUG_APP_TRANSITIONS) Slog.v(TAG,
@@ -9037,6 +9075,39 @@ public class WindowManagerService extends IWindowManager.Stub
                 if (!wtoken.allDrawn && !wtoken.startingDisplayed
                         && !wtoken.startingMoved) {
                     goodToGo = false;
+                }
+            }
+            if (goodToGo && isWallpaperVisible(mWallpaperTarget)) {
+                boolean wallpaperGoodToGo = true;
+                for (int curTokenIndex = mWallpaperTokens.size() - 1;
+                        curTokenIndex >= 0 && wallpaperGoodToGo; curTokenIndex--) {
+                    WindowToken token = mWallpaperTokens.get(curTokenIndex);
+                    for (int curWallpaperIndex = token.windows.size() - 1; curWallpaperIndex >= 0;
+                            curWallpaperIndex--) {
+                        WindowState wallpaper = token.windows.get(curWallpaperIndex);
+                        if (wallpaper.mWallpaperVisible && !wallpaper.isDrawnLw()) {
+                            // We've told this wallpaper to be visible, but it is not drawn yet
+                            wallpaperGoodToGo = false;
+                            if (mWallpaperDrawState != WALLPAPER_DRAW_TIMEOUT) {
+                                // wait for this wallpaper until it is drawn or timeout
+                                goodToGo = false;
+                            }
+                            if (mWallpaperDrawState == WALLPAPER_DRAW_NORMAL) {
+                                mWallpaperDrawState = WALLPAPER_DRAW_PENDING;
+                                mH.removeMessages(H.WALLPAPER_DRAW_PENDING_TIMEOUT);
+                                mH.sendEmptyMessageDelayed(H.WALLPAPER_DRAW_PENDING_TIMEOUT,
+                                        WALLPAPER_DRAW_PENDING_TIMEOUT_DURATION);
+                            }
+                            if (DEBUG_APP_TRANSITIONS || DEBUG_WALLPAPER) Slog.v(TAG,
+                                    "Wallpaper should be visible but has not been drawn yet. " +
+                                    "mWallpaperDrawState=" + mWallpaperDrawState);
+                            break;
+                        }
+                    }
+                }
+                if (wallpaperGoodToGo) {
+                    mWallpaperDrawState = WALLPAPER_DRAW_NORMAL;
+                    mH.removeMessages(H.WALLPAPER_DRAW_PENDING_TIMEOUT);
                 }
             }
         }
@@ -9986,7 +10057,12 @@ public class WindowManagerService extends IWindowManager.Stub
                 // Don't remove this window until rotation has completed.
                 continue;
             }
-            win.reportResized();
+            if (!win.reportResized()) {
+                mInnerFields.mOrientationChangeComplete = true;
+                if (DEBUG_ORIENTATION && mDisplayFrozen) Slog.v(TAG,
+                    "win: " + win + " Resize have exception, set orientationChangeComplete to "
+                    + mInnerFields.mOrientationChangeComplete);
+            }
             mResizingWindows.remove(i);
         }
 
@@ -10627,12 +10703,13 @@ public class WindowManagerService extends IWindowManager.Stub
         }
 
         if (mWaitingForConfig || mAppsFreezingScreen > 0 || mWindowsFreezingScreen
-                || mClientFreezingScreen) {
+                || mClientFreezingScreen || !mOpeningApps.isEmpty()) {
             if (DEBUG_ORIENTATION) Slog.d(TAG,
                 "stopFreezingDisplayLocked: Returning mWaitingForConfig=" + mWaitingForConfig
                 + ", mAppsFreezingScreen=" + mAppsFreezingScreen
                 + ", mWindowsFreezingScreen=" + mWindowsFreezingScreen
-                + ", mClientFreezingScreen=" + mClientFreezingScreen);
+                + ", mClientFreezingScreen=" + mClientFreezingScreen
+                + ", mOpeningApps.size()=" + mOpeningApps.size());
             return;
         }
 

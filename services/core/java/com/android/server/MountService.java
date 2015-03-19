@@ -2424,9 +2424,16 @@ class MountService extends IMountService.Stub
         final NativeDaemonEvent event;
         try {
             event = mConnector.execute("cryptfs", "getpw");
+            if ("-1".equals(event.getMessage())) {
+                // -1 equals no password
+                return null;
+            }
             return fromHex(event.getMessage());
         } catch (NativeDaemonConnectorException e) {
             throw e.rethrowAsParcelableException();
+        } catch (IllegalArgumentException e) {
+            Slog.e(TAG, "Invalid response to getPassword");
+            return null;
         }
     }
 
@@ -2552,7 +2559,11 @@ class MountService extends IMountService.Stub
                 final UserHandle owner = volume.getOwner();
                 final boolean ownerMatch = owner == null || owner.getIdentifier() == callingUserId;
                 if (accessAll || ownerMatch) {
-                    filtered.add(volume);
+                    if (!accessAll && volume.isEmulated()) {
+                        filtered.add(0, volume);
+                    } else {
+                        filtered.add(volume);
+                    }
                 }
             }
             return filtered.toArray(new StorageVolume[filtered.size()]);
