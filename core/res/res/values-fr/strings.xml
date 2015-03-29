@@ -1875,7 +1875,8 @@
     <string name="stk_cc_ss_to_ussd" msgid="3951862188105305589">"La requête SS a été remplacée par une requête USSD."</string>
     <string name="stk_cc_ss_to_ss" msgid="5470768854991452695">"La requête SS a été remplacée par une autre requête SS."</string>
 
-    <!-- kill app long press back -->Application arrêtée.</string>
+    <!-- kill app long press back -->
+    <string name="app_killed_message">Application arrêtée.</string>
 
     <!-- Title of dialog to confirm rebooting. -->
     <string name="reboot_title">Redémarrer</string>
