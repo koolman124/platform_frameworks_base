@@ -411,16 +411,6 @@ public final class ActivityManagerService extends ActivityManagerNative
         return (isFg) ? mFgBroadcastQueue : mBgBroadcastQueue;
     }
 
-    BroadcastRecord broadcastRecordForReceiverLocked(IBinder receiver) {
-        for (BroadcastQueue queue : mBroadcastQueues) {
-            BroadcastRecord r = queue.getMatchingOrderedReceiver(receiver);
-            if (r != null) {
-                return r;
-            }
-        }
-        return null;
-    }
-
     /**
      * Activity we have told the window manager to have key focus.
      */
@@ -1226,7 +1216,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                 TAG, "Death received in " + this
                 + " for thread " + mAppThread.asBinder());
             synchronized(ActivityManagerService.this) {
-                appDiedLocked(mApp, mPid, mAppThread);
+                appDiedLocked(mApp, mPid, mAppThread, true);
             }
         }
     }
@@ -4745,10 +4735,11 @@ public final class ActivityManagerService extends ActivityManagerNative
     }
 
     final void appDiedLocked(ProcessRecord app) {
-       appDiedLocked(app, app.pid, app.thread);
+       appDiedLocked(app, app.pid, app.thread, false);
     }
 
-    final void appDiedLocked(ProcessRecord app, int pid, IApplicationThread thread) {
+    final void appDiedLocked(ProcessRecord app, int pid, IApplicationThread thread,
+            boolean fromBinderDied) {
         // First check if this ProcessRecord is actually active for the pid.
         synchronized (mPidsSelfLocked) {
             ProcessRecord curProc = mPidsSelfLocked.get(pid);
@@ -4764,7 +4755,9 @@ public final class ActivityManagerService extends ActivityManagerNative
         }
 
         if (!app.killed) {
-            Process.killProcessQuiet(pid);
+            if (!fromBinderDied) {
+                Process.killProcessQuiet(pid);
+            }
             Process.killProcessGroup(app.info.uid, pid);
             app.killed = true;
         }
@@ -5908,6 +5901,7 @@ public final class ActivityManagerService extends ActivityManagerNative
             // Take care of any services that are waiting for the process.
             mServices.processStartTimedOutLocked(app);
             app.kill("start timeout", true);
+            removeLruProcessLocked(app);
             if (mBackupTarget != null && mBackupTarget.app.pid == pid) {
                 Slog.w(TAG, "Unattached app died before backup, skipping");
                 try {
@@ -9487,11 +9481,13 @@ public final class ActivityManagerService extends ActivityManagerNative
                             if (DEBUG_PROVIDER) {
                                 Slog.d(TAG, "Installing in existing process " + proc);
                             }
-                            checkTime(startTime, "getContentProviderImpl: scheduling install");
-                            proc.pubProviders.put(cpi.name, cpr);
-                            try {
-                                proc.thread.scheduleInstallProvider(cpi);
-                            } catch (RemoteException e) {
+                            if (!proc.pubProviders.containsKey(cpi.name)) {
+                                checkTime(startTime, "getContentProviderImpl: scheduling install");
+                                proc.pubProviders.put(cpi.name, cpr);
+                                try {
+                                    proc.thread.scheduleInstallProvider(cpi);
+                                } catch (RemoteException e) {
+                                }
                             }
                         } else {
                             checkTime(startTime, "getContentProviderImpl: before start process");
@@ -15766,11 +15762,11 @@ public final class ActivityManagerService extends ActivityManagerNative
             synchronized(this) {
                 ReceiverList rl = mRegisteredReceivers.get(receiver.asBinder());
                 if (rl != null) {
-                    if (rl.curBroadcast != null) {
-                        BroadcastRecord r = rl.curBroadcast;
-                        final boolean doNext = finishReceiverLocked(
-                                receiver.asBinder(), r.resultCode, r.resultData,
-                                r.resultExtras, r.resultAbort);
+                    final BroadcastRecord r = rl.curBroadcast;
+                    if (r != null && r == r.queue.getMatchingOrderedReceiver(r)) {
+                        final boolean doNext = r.queue.finishReceiverLocked(
+                                r, r.resultCode, r.resultData, r.resultExtras,
+                                r.resultAbort, false);
                         if (doNext) {
                             doTrim = true;
                             r.queue.processNextBroadcast(false);
@@ -16461,17 +16457,6 @@ public final class ActivityManagerService extends ActivityManagerNative
         }
     }
 
-    private final boolean finishReceiverLocked(IBinder receiver, int resultCode,
-            String resultData, Bundle resultExtras, boolean resultAbort) {
-        final BroadcastRecord r = broadcastRecordForReceiverLocked(receiver);
-        if (r == null) {
-            Slog.w(TAG, "finishReceiver called but not found on queue");
-            return false;
-        }
-
-        return r.queue.finishReceiverLocked(r, resultCode, resultData, resultExtras, resultAbort, false);
-    }
-
     void backgroundServicesFinishedLocked(int userId) {
         for (BroadcastQueue queue : mBroadcastQueues) {
             queue.backgroundServicesFinishedLocked(userId);
@@ -16479,7 +16464,7 @@ public final class ActivityManagerService extends ActivityManagerNative
     }
 
     public void finishReceiver(IBinder who, int resultCode, String resultData,
-            Bundle resultExtras, boolean resultAbort) {
+            Bundle resultExtras, boolean resultAbort, int flags) {
         if (DEBUG_BROADCAST) Slog.v(TAG, "Finish receiver: " + who);
 
         // Refuse possible leaked file descriptors
@@ -16493,7 +16478,9 @@ public final class ActivityManagerService extends ActivityManagerNative
             BroadcastRecord r;
 
             synchronized(this) {
-                r = broadcastRecordForReceiverLocked(who);
+                BroadcastQueue queue = (flags & Intent.FLAG_RECEIVER_FOREGROUND) != 0
+                        ? mFgBroadcastQueue : mBgBroadcastQueue;
+                r = queue.getMatchingOrderedReceiver(who);
                 if (r != null) {
                     doNext = r.queue.finishReceiverLocked(r, resultCode,
                         resultData, resultExtras, resultAbort, true);
